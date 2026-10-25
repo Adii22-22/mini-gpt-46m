@@ -10,6 +10,7 @@ from model.gpt import GPT
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", default="gpt_best.pt")
+    parser.add_argument("--tokenizer", default=config.TOKENIZER_PATH)
     parser.add_argument("--prompt", default="Once upon a time")
     parser.add_argument("--tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.8)
@@ -21,8 +22,7 @@ def main():
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
-    tokenizer = Tokenizer.from_file(config.TOKENIZER_PATH)
-    assert tokenizer.get_vocab_size() == config.VOCAB_SIZE, ("Tokenizer vocabulary does not match config.VOCAB_SIZE")
+    tokenizer = Tokenizer.from_file(args.tokenizer)
     eos_id = tokenizer.token_to_id("<|endoftext|>")
 
     # CPU is fine for generation and avoids DirectML issues
@@ -34,7 +34,7 @@ def main():
         max_seq_len=config.MAX_SEQ_LEN,
         dropout=config.DROPOUT,
     )
-    model.load_state_dict(torch.load(args.ckpt, map_location="cpu",weights_only=True))
+    model.load_state_dict(torch.load(args.ckpt, map_location="cpu"))
     model.eval()
     print(f"Loaded {args.ckpt} | temp={args.temperature} top_k={args.top_k}\n")
 

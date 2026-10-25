@@ -1,71 +1,135 @@
-import hashlib
 import math
 import os
+import shutil
 import time
 
+import numpy as np
 import torch
 from datasets import load_dataset
-from tokenizers import Tokenizer
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 import config
 from model.gpt import GPT
 
 # ---------------------------------------------------------------
+# Data: general-purpose mix from HuggingFaceTB/smollm-corpus
+#   FineWeb-Edu (educational web pages) + Cosmopedia v2 (synthetic
+#   textbooks, blog posts and stories), roughly 5:1 by tokens.
+# ---------------------------------------------------------------
+CORPUS = "HuggingFaceTB/smollm-corpus"
+SOURCES = [
+    {"tag": "fineweb_edu", "subset": "fineweb-edu-dedup", "train_tokens": 580_000_000, "tok_docs": 40_000},
+    {"tag": "cosmopedia", "subset": "cosmopedia-v2", "train_tokens": 120_000_000, "tok_docs": 15_000},
+]
+VAL_TOKENS = 1_500_000      # held out per source (first documents of each stream)
+
+# ---------------------------------------------------------------
 # Run settings
 # ---------------------------------------------------------------
-DATASET = "noanabeshima/TinyStoriesV2"   # cleaned, GPT-4-only version
-NUM_TRAIN_STORIES = 1_000_000
-NUM_VAL_STORIES = 5_000
-MAX_STEPS = 20_000
-WARMUP_STEPS = 500
+MAX_STEPS = 42_000          # set from the 50-step test: 5h*3600 / sec_per_step
+WARMUP_STEPS = 1_000
 MIN_LR_RATIO = 0.1
 WEIGHT_DECAY = 0.1
-EVAL_EVERY = 500
-EVAL_BATCHES = 50
-LOG_EVERY = 100
-USE_COMPILE = False        # try True later; first compile takes a few minutes
-SAMPLE_PROMPT = "Once upon a time"
+EVAL_EVERY = 2_000          # validation + checkpoint (checkpoint is what lets you resume)
+EVAL_BATCHES = 20           # per validation set
+LOG_EVERY = 200
+USE_COMPILE = False         # try True in the 50-step test; compile takes a few minutes
 
 # Everything saved here survives Colab disconnects (Google Drive)
-SAVE_DIR = "/content/drive/MyDrive/gpt_run"
+SAVE_DIR = "/content/drive/MyDrive/gpt_run_50m_general"
+LOCAL_DIR = "/content/data"   # fast local copy of the token files
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 
 # ---------------------------------------------------------------
-# Data
+# Tokenizer + data preparation (each runs once, then is cached)
 # ---------------------------------------------------------------
-def tokenizer_id():
-    with open(config.TOKENIZER_PATH, "rb") as f:
-        return hashlib.md5(f.read()).hexdigest()[:8]
+def stream_docs(subset):
+    ds = load_dataset(CORPUS, subset, split="train", streaming=True)
+    ds = ds.shuffle(seed=42, buffer_size=10_000)
+    for row in ds:
+        yield row["text"]
 
 
-def build_stream(split, n, tokenizer, eos_id):
-    # cache name includes a tokenizer hash, so a new tokenizer never reuses old IDs
-    name = DATASET.split("/")[-1]
-    cache = os.path.join(SAVE_DIR, f"cache_{name}_{split}_{n}_{tokenizer_id()}.pt")
-    if os.path.exists(cache):
-        return torch.load(cache)
+def get_tokenizer():
+    path = os.path.join(SAVE_DIR, "tokenizer.json")
+    if os.path.exists(path):
+        return Tokenizer.from_file(path)
 
-    print(f"Tokenizing {n} stories from '{split}' (one time only)...")
-    ds = load_dataset(DATASET, split=f"{split}[:{n}]")
-    chunks = []
-    for i in range(0, len(ds), 1000):
-        texts = ds[i:i + 1000]["text"]
-        ids = []
-        for enc in tokenizer.encode_batch(texts):
-            ids.extend(enc.ids)
-            ids.append(eos_id)
-        chunks.append(torch.tensor(ids, dtype=torch.int16))   # vocab < 32768, saves RAM
-    data = torch.cat(chunks)
-    torch.save(data, cache)
-    return data
+    print(f"Training a {config.VOCAB_SIZE}-token tokenizer (one time only)...")
+
+    def texts():
+        for src in SOURCES:
+            for i, text in enumerate(stream_docs(src["subset"])):
+                if i >= src["tok_docs"]:
+                    break
+                yield text
+
+    tok = Tokenizer(models.BPE(unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(
+        vocab_size=config.VOCAB_SIZE,
+        min_frequency=2,
+        special_tokens=["[UNK]", "<|endoftext|>", "<|user|>", "<|assistant|>"],   # last two reserved for chat fine-tuning later
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+        show_progress=True,
+    )
+    tok.train_from_iterator(texts(), trainer=trainer)
+    tok.save(path)
+    return tok
+
+
+def build_data(tokenizer, eos_id):
+    train_path = os.path.join(SAVE_DIR, "train.bin")
+    val_paths = {s["tag"]: os.path.join(SAVE_DIR, f"val_{s['tag']}.bin") for s in SOURCES}
+    if os.path.exists(train_path) and all(os.path.exists(p) for p in val_paths.values()):
+        return train_path, val_paths
+
+    train_chunks = []
+    for src in SOURCES:
+        print(f"Tokenizing {src['subset']} (one time only)...")
+        val_chunks, v, t, batch = [], 0, 0, []
+        next_report, t0 = 50_000_000, time.time()
+        for text in stream_docs(src["subset"]):
+            batch.append(text)
+            if len(batch) < 500:
+                continue
+            for enc in tokenizer.encode_batch(batch):
+                arr = np.array(enc.ids + [eos_id], dtype=np.uint16)
+                if v < VAL_TOKENS:
+                    val_chunks.append(arr)
+                    v += len(arr)
+                else:
+                    train_chunks.append(arr)
+                    t += len(arr)
+            batch = []
+            if t >= next_report:
+                print(f"  {src['tag']}: {t:,} tokens ({time.time() - t0:.0f}s)")
+                next_report += 50_000_000
+            if t >= src["train_tokens"]:
+                break
+        np.concatenate(val_chunks).tofile(val_paths[src["tag"]])
+        print(f"  {src['tag']}: {t:,} train tokens, {v:,} val tokens")
+
+    np.concatenate(train_chunks).tofile(train_path)
+    return train_path, val_paths
+
+
+def open_tokens(path):
+    # copy from Drive to local disk once; reading from Drive during training is slow
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    dst = os.path.join(LOCAL_DIR, os.path.basename(path))
+    if not os.path.exists(dst):
+        shutil.copy(path, dst)
+    return np.memmap(dst, dtype=np.uint16, mode="r")
 
 
 def get_batch(data, batch_size, seq_len):
-    ix = torch.randint(len(data) - seq_len - 1, (batch_size,))
-    x = torch.stack([data[i:i + seq_len] for i in ix]).long()
-    y = torch.stack([data[i + 1:i + seq_len + 1] for i in ix]).long()
-    return x, y
+    ix = np.random.randint(0, len(data) - seq_len - 1, size=batch_size)
+    x = np.stack([data[i:i + seq_len] for i in ix]).astype(np.int64)
+    y = np.stack([data[i + 1:i + seq_len + 1] for i in ix]).astype(np.int64)
+    return torch.from_numpy(x), torch.from_numpy(y)
 
 
 def get_lr(step):
@@ -93,15 +157,18 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=not use_bf16)
     print(f"Mixed precision: {'bf16' if use_bf16 else 'fp16 + GradScaler'}")
 
-    tokenizer = Tokenizer.from_file(config.TOKENIZER_PATH)
+    tokenizer = get_tokenizer()
     eos_id = tokenizer.token_to_id("<|endoftext|>")
     assert tokenizer.get_vocab_size() == config.VOCAB_SIZE, (
         f"Tokenizer vocab {tokenizer.get_vocab_size()} != config.VOCAB_SIZE {config.VOCAB_SIZE}"
     )
 
-    train_data = build_stream("train", NUM_TRAIN_STORIES, tokenizer, eos_id)
-    val_data = build_stream("validation", NUM_VAL_STORIES, tokenizer, eos_id)
-    print(f"Train tokens: {len(train_data):,} | Val tokens: {len(val_data):,}")
+    train_path, val_paths = build_data(tokenizer, eos_id)
+    train_data = open_tokens(train_path)
+    val_sets = [(tag, open_tokens(p)) for tag, p in val_paths.items()]
+    print(f"Train tokens: {len(train_data):,}")
+    for tag, v in val_sets:
+        print(f"  val {tag}: {len(v):,} tokens")
 
     model = GPT(
         vocab_size=config.VOCAB_SIZE,
@@ -141,24 +208,16 @@ def main():
         return torch.autocast(device_type="cuda", dtype=amp_dtype)
 
     @torch.no_grad()
-    def estimate_loss():
+    def estimate_loss(data):
         model.eval()
         losses = []
         for _ in range(EVAL_BATCHES):
-            x, y = get_batch(val_data, config.BATCH_SIZE, config.MAX_SEQ_LEN)
+            x, y = get_batch(data, config.BATCH_SIZE, config.MAX_SEQ_LEN)
             with autocast():
                 _, loss = fwd(x.to(device), targets=y.to(device))
             losses.append(loss.item())
         model.train()
         return sum(losses) / len(losses)
-
-    def sample():
-        model.eval()
-        prompt = torch.tensor([tokenizer.encode(SAMPLE_PROMPT).ids], device=device)
-        with autocast():
-            out = model.generate(prompt, max_new_tokens=100, temperature=0.8, top_k=40)
-        model.train()
-        return tokenizer.decode(out[0].tolist())
 
     model.train()
     start = time.time()
@@ -186,14 +245,15 @@ def main():
                   f"lr {lr:.2e} | {time.time() - start:.0f}s")
 
         if (step + 1) % EVAL_EVERY == 0 or step == MAX_STEPS - 1:
-            val_loss = estimate_loss()
-            print(f"  >>> val loss {val_loss:.4f}")
+            per_set = {tag: estimate_loss(v) for tag, v in val_sets}
+            val_loss = sum(per_set.values()) / len(per_set)
+            detail = " | ".join(f"{t} {v:.4f}" for t, v in per_set.items())
+            print(f"  >>> val loss {detail} | mean {val_loss:.4f}")
 
             if val_loss < best_val:
                 best_val = val_loss
                 # plain weights only: works with generate.py on your laptop
                 torch.save(model.state_dict(), os.path.join(SAVE_DIR, "gpt_best.pt"))
-                print("  >>> saved gpt_best.pt")
 
             torch.save({
                 "model": model.state_dict(),
@@ -203,9 +263,7 @@ def main():
                 "best_val": best_val,
             }, ckpt_path)
 
-            print("  >>> sample:", sample().replace("\n", " "))
-
-    print("Done.")
+    print(f"Done. Files are in {SAVE_DIR} (gpt_best.pt and tokenizer.json)")
 
 
 if __name__ == "__main__":
