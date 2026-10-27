@@ -8,8 +8,8 @@ from model.transformer_block import TransformerBlock
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size=350, embed_size=256, num_heads=4,
-                 num_layers=4, max_seq_len=128, dropout=0.1):
+    def __init__(self, vocab_size, embed_size, num_heads,
+                 num_layers, max_seq_len, dropout=0.0):
         super().__init__()
 
         self.max_seq_len = max_seq_len
@@ -38,7 +38,7 @@ class GPT(nn.Module):
 
         # Scaled init for residual output projections (GPT-2 trick)
         for name, p in self.named_parameters():
-            if name.endswith("c_proj.weight"):
+            if name.endswith("c_proj.weight") or name.endswith("ffn.net.2.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * num_layers))
 
     def _init_weights(self, module):
@@ -100,7 +100,7 @@ class GPT(nn.Module):
 
 # --- Sanity test ---
 if __name__ == "__main__":
-    print("\n--- Testing the Full GPT Model ---")
+    print("\n--- Testing the GPT Model ---")
     VOCAB_SIZE = 350
     EMBED_SIZE = 256
     NUM_HEADS = 4

@@ -34,7 +34,7 @@ def main():
         max_seq_len=config.MAX_SEQ_LEN,
         dropout=config.DROPOUT,
     )
-    model.load_state_dict(torch.load(args.ckpt, map_location="cpu"))
+    model.load_state_dict(torch.load(args.ckpt, map_location="cpu", weights_only=True))
     model.eval()
     print(f"Loaded {args.ckpt} | temp={args.temperature} top_k={args.top_k}\n")
 

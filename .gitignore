@@ -1,3 +1,7 @@
 venv/
 __pycache__/
 *.pt
+*.bin
+.vscode/
+.env
+.DS_Store
